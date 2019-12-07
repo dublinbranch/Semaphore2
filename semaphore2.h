@@ -22,13 +22,13 @@ class Semaphore2 {
 	 * @return number of EXTIMATED free resources
 	 */
 	void release();
-
-      private:
 	/**
 	 * @brief recount will recount how many lock has sharedLockFD
 	 * @return
 	 */
 	uint32_t recount();
+
+      private:
 	//This will be used like a mutex to protec shared mem initialization
 	std::string singleLockName;
 	//This will be used to count how many process are attive

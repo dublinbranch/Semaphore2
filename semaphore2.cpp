@@ -11,6 +11,7 @@
 #include <thread>
 #include <time.h>
 #include <unistd.h>
+#include <iostream>
 
 namespace fs = std::filesystem;
 using namespace std;
@@ -67,7 +68,7 @@ bool SHMMutex::tryLock() {
  * think about it as a singleton, only between several process, and different time too
  */
 struct SharedDB {
-	static const uint32_t currentRevisionId = 6;
+	static const uint32_t currentRevisionId = 7;
 	uint32_t              revisionId;
 
 	//We use atomic, because this code is shared between processes!
@@ -114,11 +115,12 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 			auto err  = std::make_error_code(errc::bad_address);
 			throw fs::filesystem_error(what, path, err);
 		}
-		sharedLockName = _path + ".shared";
-		singleLockName = _path + ".single";
+
+		sharedLockName = fs::absolute(_path + ".shared");
+		singleLockName = fs::absolute(_path + ".single");
 	} else {
-		sharedLockName = "sem2Lock.shared";
-		singleLockName = "sem2Lock.single";
+		sharedLockName = fs::absolute("sem2Lock.shared");
+		singleLockName = fs::absolute("sem2Lock.single");
 	}
 
 	singleLockFD = open(singleLockName.c_str(), O_CREAT | O_RDWR, 0666);
@@ -138,6 +140,8 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 	//we use the singleLockFD like a spinlock
 	//Do not try to use LOCK_NB! You can remain here for hours...
 	//also note the initialization part is very few microsecond
+
+	//TODO this is still broken
 	uint maxTry = 100;
 	uint curTry = 0;
 	do {
@@ -227,6 +231,9 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 					break;
 				}
 			}
+			if (flock(sharedLockFD, LOCK_SH | LOCK_NB) == 0) {
+				//TODO error check -.-
+			}
 			sharedDB->mutex.unlock();
 			return true;
 		}
@@ -238,10 +245,49 @@ void Semaphore2::release() {
 	sharedDB->acquiredCount--;
 	//free the record
 	sharedDB->pidArray[pidPos] = 0;
+	if (flock(sharedLockFD, LOCK_UN) == 0) {
+		//TODO error check -.-
+	}
+	sharedDB->mutex.unlock();
 }
+
+uint pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint pidCount){
+	//this function must run under the LOCKED MUTEX!!!
+	uint stillUsed = 0;
+	fs::path path = _path;
+	for (uint pidPos = 0; pidPos < pidCount; ++pidPos) {
+		if (pidArray[pidPos] != 0) { //find an empty space
+			auto curPid = pidArray[pidPos].load();
+			auto dir = fs::path ("/proc/"+ to_string(curPid) +"/fd/");
+			if(!fs::exists(dir)){
+				pidArray[pidPos] = 0;
+				continue;
+			}
+			for(auto&& file: fs::directory_iterator(dir)){
+				cout << file << "\n";
+				auto target = fs::read_symlink(file);
+				if(target == path){
+					stillUsed++;
+				}
+			}
+		}
+	}
+	return stillUsed;
+}
+
 
 uint32_t Semaphore2::recount() {
 	chrono::high_resolution_clock timer;
 	auto                          now = timer.now();
+	//Poor man lslocks, on a production server of ours
+	//lsof takes 0.5 second, lslock... I terminated after 5 second (non busy server)
+	//So is totally unconceivable to run the stock version...
+	//There is also fuser which takes 0.17 on my machine and 0.28 on prod server (non busy)
+	//for fuser systime is > 80% of total...
+
+
 	sharedDB->lastRecount             = chrono::time_point_cast<chrono::nanoseconds>(now).time_since_epoch().count();
+
+	pmFuser(sharedLockName,sharedDB->pidArray, sharedDB->maxResources.load());
 }
+

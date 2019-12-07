@@ -26,11 +26,13 @@ int main() {
 
 //	exit(0);
 	try {
+		using namespace std::chrono_literals;
 		Semaphore2 sem;
 		sem.init(50,"geppetto");
-		using namespace std::chrono_literals;
 		sem.acquire(1s);
-		sem.release();
+		sem.recount();
+
+		//sem.release();
 
 	} catch (const std::exception& e) {
 		printf("%s",e.what());
