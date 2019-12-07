@@ -62,8 +62,12 @@ bool SHMMutex::tryLock() {
 	return true;
 }
 
+/**
+ * @brief The SharedDB struct
+ * think about it as a singleton, only between several process, and different time too
+ */
 struct SharedDB {
-	static const uint32_t currentRevisionId = 4;
+	static const uint32_t currentRevisionId = 6;
 	uint32_t              revisionId;
 
 	//We use atomic, because this code is shared between processes!
@@ -89,6 +93,7 @@ struct SharedDB {
 		acquiredCount = 0;
 		maxResources  = max;
 		mutex.init();
+		memset(&pidArray, 0, max * sizeof(__pid_t)); //I think is not needed but...
 	}
 	static uint32_t spaceRequired(uint32_t max) {
 		return sizeof(SharedDB) + max * sizeof(__pid_t);
@@ -172,8 +177,8 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 		bootStrapSharedDb = true;
 	}
 	if (bootStrapSharedDb) {
-		new (mmapped) SharedDB();
-		sharedDB->init(maxResources);
+		new (mmapped) SharedDB();     //std constructor initialization stuff
+		sharedDB->init(maxResources); //some... other stuff
 	}
 
 	//and unlocked so the other can start to run
@@ -215,6 +220,13 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 			continue;
 		} else {
 			sharedDB->acquiredCount.store(newValue);
+			auto curPid = getpid();
+			for (pidPos = 0; pidPos < sharedDB->maxResources; ++pidPos) {
+				if (sharedDB->pidArray[pidPos] == 0) { //find an empty space
+					sharedDB->pidArray[pidPos] = curPid;
+					break;
+				}
+			}
 			sharedDB->mutex.unlock();
 			return true;
 		}
@@ -222,7 +234,10 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 }
 
 void Semaphore2::release() {
+	sharedDB->mutex.lock();
 	sharedDB->acquiredCount--;
+	//free the record
+	sharedDB->pidArray[pidPos] = 0;
 }
 
 uint32_t Semaphore2::recount() {

@@ -37,6 +37,9 @@ class Semaphore2 {
 	int singleLockFD = 0;
 	int sharedLockFD = 0;
 
+	//in which pos of the sharedDB pidArray we registered ourself
+	int pidPos = 0;
+
 	SharedDB* sharedDB = nullptr;
 };
 #endif // SEMAPHORE2_H
