@@ -1,49 +1,42 @@
 #ifndef SEMAPHORE2_H
 #define SEMAPHORE2_H
 
-#include <atomic>
-#include <mutex>
 #include <string>
-struct Process{
-	//not reliable for short living process, please do not use alone
-	uint32_t pid = 0;
-	//two process can not start at the same exact time, we rely on this to surely identify each one
+#include <chrono>
 
-	//int clock_gettime(clockid_t clk_id, struct timespec *tp);
-	uint64_t startTime =  0;
-};
+class SharedDB;
 
 class Semaphore2 {
-public:
+      public:
 	Semaphore2() = default;
-	bool setPath(const std::string& _path);
-	std::string getPath();
-	bool init(uint16_t maxResources, const std::string& _poolName = std::string());
-	const char *getRevision() const noexcept;
-	std::string getPoolName() const;
-	void setPoolName(const std::string &value);
+	bool init(uint32_t maxResources, const std::string& _path = std::string());
 
 	/**
 	 * @brief lock will block until a lock can be acquired
 	 * @param maxWait in ns, default 1 sec (10^9)
-	 * @return true if locked false if expired
+	 * @return true (num of still available resources before the lock) if locked false if expired
 	 */
-	bool lock(uint64_t maxWait = 1000000000);
-private:
-	bool openCreateGeneralLock();
-
-	//the base path where all the lock file will be placed (and also the shared db stuff)
-	std::string basePath;
-	//probably never used, is the name in case we share folder...
-	std::string poolName;
-	std::atomic<int32_t> arraySize = 0;
-	std::atomic<int32_t> maxResources = 0;
-	std::mutex shmopMutex;
-	int generalLockFD = 0;
+	bool acquire(const std::chrono::nanoseconds &maxWait);
 	/**
-	 * @brief process is the array that has the info of the running/subscribed process, is dinamically extended via shmop
-	 * we do not really care now of having gap of this one growing too big
+	 * @brief release previously acquired resource
+	 * @return number of EXTIMATED free resources
 	 */
-	Process* process;
+	void release();
+
+      private:
+	/**
+	 * @brief recount will recount how many lock has sharedLockFD
+	 * @return
+	 */
+	uint32_t recount();
+	//This will be used like a mutex to protec shared mem initialization
+	std::string singleLockName;
+	//This will be used to count how many process are attive
+	std::string sharedLockName;
+
+	int singleLockFD = 0;
+	int sharedLockFD = 0;
+
+	SharedDB* sharedDB = nullptr;
 };
 #endif // SEMAPHORE2_H

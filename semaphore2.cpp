@@ -1,67 +1,232 @@
 #include "semaphore2.h"
-#include <QDebug>
-#include <QDir>
+#include <atomic>
+#include <exception>
 #include <filesystem>
+#include <mutex>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <system_error>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
+
 namespace fs = std::filesystem;
-bool Semaphore2::setPath(const std::string& _path) {
-	//TODO check if this is a valid path
-	if (!basePath.empty()) {
-		throw "too late to change path";
+using namespace std;
+
+class SHMMutex {
+      private:
+	pthread_mutex_t _handle;
+
+      public:
+	explicit SHMMutex() = default;
+	void init();
+	virtual ~SHMMutex();
+
+	void lock();
+	void unlock();
+	bool tryLock();
+};
+
+void SHMMutex::init() {
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_FAST_NP);
+
+	if (pthread_mutex_init(&_handle, &attr) == -1) {
+		throw "Unable to create mutex";
 	}
-	basePath = _path;
+}
+SHMMutex::~SHMMutex() {
+	::pthread_mutex_destroy(&_handle);
+}
+void SHMMutex::lock() {
+	if (::pthread_mutex_lock(&_handle) != 0) {
+		throw "Unable to lock mutex";
+	}
+}
+void SHMMutex::unlock() {
+	if (::pthread_mutex_unlock(&_handle) != 0) {
+		throw "Unable to unlock mutex";
+	}
+}
+bool SHMMutex::tryLock() {
+	int tryResult = ::pthread_mutex_trylock(&_handle);
+	if (tryResult != 0) {
+		if (EBUSY == tryResult)
+			return false;
+		throw "Unable to lock mutex";
+	}
+	return true;
 }
 
-std::string Semaphore2::getPath() {
-	if (basePath.empty()) {
-		//if no path just use CWD folder, and create a subone else use the specified one
-		//max path lenght https://unix.stackexchange.com/a/32834/165087
-		char buffer[4096];
-		auto bufWritten = readlink("/proc/self/exe", buffer, 4096);
-		if (bufWritten == 0) {
-			throw "Impossible to read the path o.O";
+struct SharedDB {
+	static const uint32_t currentRevisionId = 4;
+	uint32_t              revisionId;
+
+	//We use atomic, because this code is shared between processes!
+
+	//Note that there is NO DEFAULt VALUE (else on init they will be overwritten)
+	//This is int to catch negative error / avoid overflow ?
+	std::atomic<uint32_t> acquiredCount;
+	std::atomic<uint32_t> maxResources;
+	//TODO implement This is used to avoid recounting continuously. is useless!
+	std::atomic<uint64_t> lastRecount;
+	//to speed up lock recount we keep a list of pid that are subscribed to this sempaphore
+	//Else we need to scan all process ! and on a busy server this is a ton of syscall and time
+	//OFC this need to be at the end, because is dynamic
+
+	//I have no idea if is possible to manipulate a list of fixed size with no mutex.
+	SHMMutex mutex;
+
+	//array is inited only to avoid warning, real dimension will be computed later, OFC size can not exceed allowed max resources!
+	std::atomic<__pid_t> pidArray[1];
+
+	void init(uint32_t max) {
+		revisionId    = currentRevisionId;
+		acquiredCount = 0;
+		maxResources  = max;
+		mutex.init();
+	}
+	static uint32_t spaceRequired(uint32_t max) {
+		return sizeof(SharedDB) + max * sizeof(__pid_t);
+	}
+};
+
+/**
+ * @brief Semaphore2::init
+ * @param maxResources
+ * @param _path TODO check a file path and not a folder
+ * @return
+ */
+bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
+	if (!_path.empty()) {
+		fs::path path = _path;
+		if (!path.has_filename()) {
+			auto what = std::string("is not a file!");
+			auto err  = std::make_error_code(errc::bad_address);
+			throw fs::filesystem_error(what, path, err);
 		}
-		fs::path myFilePath(std::string(buffer, bufWritten));
-		basePath = myFilePath.parent_path();
+		sharedLockName = _path + ".shared";
+		singleLockName = _path + ".single";
+	} else {
+		sharedLockName = "sem2Lock.shared";
+		singleLockName = "sem2Lock.single";
 	}
-	return basePath;
-}
 
+	singleLockFD = open(singleLockName.c_str(), O_CREAT | O_RDWR, 0666);
+	if (singleLockFD == -1) {
+		auto what = std::string("impossible to open ");
+		auto err  = std::make_error_code(errc::io_error);
+		throw fs::filesystem_error(what, singleLockName, err);
+	}
 
-bool Semaphore2::init(uint16_t maxResources, const std::string& _poolName) {
-	setPoolName(_poolName);
-	fs::create_directory(getPath() + "/" + getPoolName());
+	sharedLockFD = open(sharedLockName.c_str(), O_CREAT | O_RDWR, 0666);
+	if (sharedLockFD == -1) {
+		auto what = std::string("impossible to open ");
+		auto err  = std::make_error_code(errc::io_error);
+		throw fs::filesystem_error(what, singleLockName, err);
+	}
 
-	//we now have to check if something exist in the directory
-	//what can possibly be inside is the Semaphore2.db
-	//and the microTime.lock
+	//we use the singleLockFD like a spinlock
+	//Do not try to use LOCK_NB! You can remain here for hours...
+	//also note the initialization part is very few microsecond
+	uint maxTry = 100;
+	uint curTry = 0;
+	do {
+		curTry++;
+		if (flock(singleLockFD, LOCK_EX | LOCK_NB) == 0) {
+			break;
+		}
+		std::this_thread::yield();
+	} while (curTry < maxTry);
 
-	//if the Semaphore2.db is present
+	//Do the system is already bootstrapped ?
+	struct stat buf;
+	fstat(singleLockFD, &buf);
+	bool bootStrapSharedDb = false;
+	if (buf.st_size != SharedDB::spaceRequired(maxResources)) {
+		//Initialization in our case is resize to accomodate the struct that need to be stored
+		ftruncate(singleLockFD, SharedDB::spaceRequired(maxResources));
+		bootStrapSharedDb = true;
+	}
 
-	//and unlocked it means sistem has already been bootstrapped
+	//in any case we need to mmap, in theory is 15usec faster to mmap after we know system is already bootstrapped
+	//But is irrelevant for a once off operaton
+	auto mmapped = mmap(nullptr, SharedDB::spaceRequired(maxResources), PROT_READ | PROT_WRITE, MAP_SHARED, singleLockFD, 0);
+	if (mmapped == MAP_FAILED) {
+		auto err = errno;
+		auto msg = strerror(err);
+		throw std::string("impossible to mmap: ").append(msg);
+	}
 
+	sharedDB = static_cast<SharedDB*>(mmapped);
+	if (sharedDB->revisionId != SharedDB::currentRevisionId) {
+		printf("Revision mismatch, regenerating\n");
+		bootStrapSharedDb = true;
+	}
+	if (sharedDB->maxResources != maxResources) {
+		printf("maxResources mismatch, regenerating\n");
+		bootStrapSharedDb = true;
+	}
+	if (bootStrapSharedDb) {
+		new (mmapped) SharedDB();
+		sharedDB->init(maxResources);
+	}
 
-	this->maxResources = maxResources;
+	//and unlocked so the other can start to run
+	if (flock(singleLockFD, LOCK_UN) == -1) {
+		throw "impossible to unlock, how is that even possible";
+	}
+
 	//TODO add some check if we have enought space left to create folder and file name!
 	return true;
 }
 
-const char* Semaphore2::getRevision() const noexcept {
-	static const char semaphore2_library_version[] = "1";
-	static const char __xyz[]                      = "semaphore2_library_version 1";
-	return semaphore2_library_version;
-}
+bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
+	//TODO check if monotonic bla bla bla
+	std::chrono::high_resolution_clock timer;
+	auto                               startTime = timer.now();
 
-std::string Semaphore2::getPoolName() const {
-	return poolName;
-}
+	bool firstLoop = true;
+	while (true) {
+		if (!firstLoop) {
+			//check if this took too much time and just abandon the task
+			auto curTime = timer.now();
+			auto elapsed = curTime - startTime;
+			if (elapsed > maxWait) {
+				return false;
+			}
 
-void Semaphore2::setPoolName(const std::string& value) {
-	if (value.empty()) {
-		poolName = "SemPool";
-	} else {
-		poolName = value;
+			//here we can use a pthread_cond_signal instead of sleeping
+			this_thread::sleep_for(1s);
+		}
+
+		sharedDB->mutex.lock();
+		auto oldValue = sharedDB->acquiredCount.load();
+		auto newValue = oldValue + 1;
+		if (newValue >= sharedDB->maxResources) {
+			//This part is INTENTIONALLY under the mutex, so we avoid having X process doing the same thing, all of them (except one at most) failing!!!
+			sharedDB->acquiredCount = recount();
+			firstLoop               = false;
+			sharedDB->mutex.unlock();
+			continue;
+		} else {
+			sharedDB->acquiredCount.store(newValue);
+			sharedDB->mutex.unlock();
+			return true;
+		}
 	}
-	poolName.append("_").append(getRevision());
+}
+
+void Semaphore2::release() {
+	sharedDB->acquiredCount--;
+}
+
+uint32_t Semaphore2::recount() {
+	chrono::high_resolution_clock timer;
+	auto                          now = timer.now();
+	sharedDB->lastRecount             = chrono::time_point_cast<chrono::nanoseconds>(now).time_since_epoch().count();
 }

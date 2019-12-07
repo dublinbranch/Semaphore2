@@ -1,8 +1,4 @@
 #include "semaphore2.h"
-#include <QDebug>
-#include <QElapsedTimer>
-#include <qsharedmemory.h>
-
 //#include <QDir>
 //#include <QSemaphore>
 #include <iostream>
@@ -29,10 +25,16 @@ int main() {
 //	qDebug() << t1 << t2;
 
 //	exit(0);
+	try {
+		Semaphore2 sem;
+		sem.init(50,"geppetto");
+		using namespace std::chrono_literals;
+		sem.acquire(1s);
+		sem.release();
 
-	Semaphore2 sem;
-	sem.init(2);
-	sem.lock();
+	} catch (const std::exception& e) {
+		printf("%s",e.what());
+	}
 
 //	auto f   = fopen("testfile", "w+");
 //	auto fNo = fileno(f);
