@@ -1,17 +1,17 @@
 #include "semaphore2.h"
 #include <atomic>
+#include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
+#include <iostream>
 #include <mutex>
-#include <string.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <system_error>
 #include <thread>
-#include <time.h>
 #include <unistd.h>
-#include <iostream>
 
 namespace fs = std::filesystem;
 using namespace std;
@@ -68,7 +68,7 @@ bool SHMMutex::tryLock() {
  * think about it as a singleton, only between several process, and different time too
  */
 struct SharedDB {
-	static const uint32_t currentRevisionId = 7;
+	static const uint32_t currentRevisionId = 8;
 	uint32_t              revisionId;
 
 	//We use atomic, because this code is shared between processes!
@@ -97,7 +97,9 @@ struct SharedDB {
 		memset(&pidArray, 0, max * sizeof(__pid_t)); //I think is not needed but...
 	}
 	static uint32_t spaceRequired(uint32_t max) {
-		return sizeof(SharedDB) + max * sizeof(__pid_t);
+		uint32_t size = sizeof(SharedDB) + max * sizeof(__pid_t);
+		//std::cout << size << "\n";
+		return size;
 	}
 };
 
@@ -165,6 +167,7 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 	//in any case we need to mmap, in theory is 15usec faster to mmap after we know system is already bootstrapped
 	//But is irrelevant for a once off operaton
 	auto mmapped = mmap(nullptr, SharedDB::spaceRequired(maxResources), PROT_READ | PROT_WRITE, MAP_SHARED, singleLockFD, 0);
+
 	if (mmapped == MAP_FAILED) {
 		auto err = errno;
 		auto msg = strerror(err);
@@ -185,6 +188,10 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 		sharedDB->init(maxResources); //some... other stuff
 	}
 
+	//	std::cout << "shared" << sharedDB << "\n";
+	//	std::cout << "revId" << &sharedDB->revisionId << "\n";
+	//	std::cout << "max" << &sharedDB->maxResources << "\n";
+
 	//and unlocked so the other can start to run
 	if (flock(singleLockFD, LOCK_UN) == -1) {
 		throw "impossible to unlock, how is that even possible";
@@ -198,6 +205,10 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 	//TODO check if monotonic bla bla bla
 	std::chrono::high_resolution_clock timer;
 	auto                               startTime = timer.now();
+
+	//	std::cout << "shared" << &sharedDB << "\n";
+	//	std::cout << "revId" << &sharedDB->revisionId << "\n";
+	//	std::cout << "max" << &sharedDB->maxResources << "\n";
 
 	bool firstLoop = true;
 	while (true) {
@@ -251,22 +262,22 @@ void Semaphore2::release() {
 	sharedDB->mutex.unlock();
 }
 
-uint pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint pidCount){
+uint pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint pidCount) {
 	//this function must run under the LOCKED MUTEX!!!
-	uint stillUsed = 0;
-	fs::path path = _path;
+	uint     stillUsed = 0;
+	fs::path path      = _path;
 	for (uint pidPos = 0; pidPos < pidCount; ++pidPos) {
 		if (pidArray[pidPos] != 0) { //find an empty space
 			auto curPid = pidArray[pidPos].load();
-			auto dir = fs::path ("/proc/"+ to_string(curPid) +"/fd/");
-			if(!fs::exists(dir)){
+			auto dir    = fs::path("/proc/" + to_string(curPid) + "/fd/");
+			if (!fs::exists(dir)) {
 				pidArray[pidPos] = 0;
 				continue;
 			}
-			for(auto&& file: fs::directory_iterator(dir)){
-				cout << file << "\n";
+			for (auto&& file : fs::directory_iterator(dir)) {
+				//cout << file << "\n";
 				auto target = fs::read_symlink(file);
-				if(target == path){
+				if (target == path) {
 					stillUsed++;
 				}
 			}
@@ -275,19 +286,24 @@ uint pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint pid
 	return stillUsed;
 }
 
-
 uint32_t Semaphore2::recount() {
-	chrono::high_resolution_clock timer;
-	auto                          now = timer.now();
+	typedef chrono::high_resolution_clock timer;
+	auto                                  start = timer::now();
 	//Poor man lslocks, on a production server of ours
 	//lsof takes 0.5 second, lslock... I terminated after 5 second (non busy server)
 	//So is totally unconceivable to run the stock version...
 	//There is also fuser which takes 0.17 on my machine and 0.28 on prod server (non busy)
 	//for fuser systime is > 80% of total...
 
+	//this one having to scan just a few process with few files open is around 10uS
+	//1 process with 100 file is 523uS
+	//If we scan 20 process with 100+ files open each is instead 23ms, so time scaling is linear
+	auto effective = pmFuser(sharedLockName, sharedDB->pidArray, sharedDB->maxResources.load());
+	auto end       = timer::now();
+	auto delta     = end - start;
 
-	sharedDB->lastRecount             = chrono::time_point_cast<chrono::nanoseconds>(now).time_since_epoch().count();
-
-	pmFuser(sharedLockName,sharedDB->pidArray, sharedDB->maxResources.load());
+	sharedDB->acquiredCount = effective;
+	//uint64_t neu = chrono::time_point_cast<chrono::nanoseconds>(now).time_since_epoch().count();
+	//sharedDB->lastRecount.store(neu);
+	return 0;
 }
-

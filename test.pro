@@ -19,13 +19,13 @@ SOURCES += \
         main.cpp \
         semaphore2.cpp
 
-#QMAKE_CXXFLAGS += -O3 -march=native #-flto -fuse-ld=gold -fuse-linker-plugin
+#QMAKE_CXXFLAGS += -O0 -march=native #-flto -fuse-ld=gold -fuse-linker-plugin
 
 #LIBS += -L$$PWD/mmap_allocator/ -l:libmmap_allocator.a
 
-# QMAKE_CXXFLAGS+= -fsanitize=address -fno-omit-frame-pointer
-# QMAKE_CFLAGS+= -fsanitize=address -fno-omit-frame-pointer
-# QMAKE_LFLAGS+= -fsanitize=address -fno-omit-frame-pointer
+#QMAKE_CXXFLAGS+= -fsanitize=address -fno-omit-frame-pointer
+#QMAKE_CFLAGS+= -fsanitize=address -fno-omit-frame-pointer
+#QMAKE_LFLAGS+= -fsanitize=address -fno-omit-frame-pointer
 
 HEADERS += \
     semaphore2.h
