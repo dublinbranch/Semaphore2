@@ -12,6 +12,7 @@
 #include <system_error>
 #include <thread>
 #include <unistd.h>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 using namespace std;
@@ -68,25 +69,23 @@ bool SHMMutex::tryLock() {
  * think about it as a singleton, only between several process, and different time too
  */
 struct SharedDB {
-	static const uint32_t currentRevisionId = 8;
+	static const uint32_t currentRevisionId = 13;
 	uint32_t              revisionId;
 
-	//We use atomic, because this code is shared between processes!
-
 	//Note that there is NO DEFAULt VALUE (else on init they will be overwritten)
-	//This is int to catch negative error / avoid overflow ?
-	std::atomic<uint32_t> acquiredCount;
+	//We use atomic, because this code is shared between processes!
 	std::atomic<uint32_t> maxResources;
+
 	//TODO implement This is used to avoid recounting continuously. is useless!
 	std::atomic<uint64_t> lastRecount;
-	//to speed up lock recount we keep a list of pid that are subscribed to this sempaphore
-	//Else we need to scan all process ! and on a busy server this is a ton of syscall and time
-	//OFC this need to be at the end, because is dynamic
 
 	//I have no idea if is possible to manipulate a list of fixed size with no mutex.
 	SHMMutex mutex;
 
+	std::atomic<uint32_t> acquiredCount;
 	//array is inited only to avoid warning, real dimension will be computed later, OFC size can not exceed allowed max resources!
+	//to speed up lock recount we keep a list of pid that are subscribed to this sempaphore
+	//Else we need to scan all process ! and on a busy server this is a ton of syscall and time
 	std::atomic<__pid_t> pidArray[1];
 
 	void init(uint32_t max) {
@@ -102,6 +101,18 @@ struct SharedDB {
 		return size;
 	}
 };
+
+
+/**
+ * @brief The Info struct is for info / debug purpose
+ * overhead is minimal so is kept active
+ */
+struct Info{
+	std::atomic<uint> recountDone = 0;
+	std::atomic<uint> recountSkipped = 0;
+};
+
+static Info info;
 
 /**
  * @brief Semaphore2::init
@@ -132,27 +143,23 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 		throw fs::filesystem_error(what, singleLockName, err);
 	}
 
-	sharedLockFD = open(sharedLockName.c_str(), O_CREAT | O_RDWR, 0666);
-	if (sharedLockFD == -1) {
-		auto what = std::string("impossible to open ");
-		auto err  = std::make_error_code(errc::io_error);
-		throw fs::filesystem_error(what, singleLockName, err);
-	}
-
 	//we use the singleLockFD like a spinlock
 	//Do not try to use LOCK_NB! You can remain here for hours...
-	//also note the initialization part is very few microsecond
+	//also note the initialization part is very few microsecond so sleep is minimal
 
 	//TODO this is still broken
 	uint maxTry = 100;
 	uint curTry = 0;
-	do {
+	while (true) {
 		curTry++;
 		if (flock(singleLockFD, LOCK_EX | LOCK_NB) == 0) {
 			break;
 		}
-		std::this_thread::yield();
-	} while (curTry < maxTry);
+		if (curTry > maxTry) {
+			throw std::runtime_error("too many trial to lock" + singleLockName);
+		}
+		std::this_thread::sleep_for(0.001ms);
+	}
 
 	//Do the system is already bootstrapped ?
 	struct stat buf;
@@ -196,6 +203,8 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 	if (flock(singleLockFD, LOCK_UN) == -1) {
 		throw "impossible to unlock, how is that even possible";
 	}
+	close(singleLockFD);
+	singleLockFD = 0;
 
 	//TODO add some check if we have enought space left to create folder and file name!
 	return true;
@@ -220,34 +229,43 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 				return false;
 			}
 
-			//here we can use a pthread_cond_signal instead of sleeping
-			this_thread::sleep_for(1s);
+			this_thread::sleep_for(0.1s);
 		}
 
 		sharedDB->mutex.lock();
-		auto oldValue = sharedDB->acquiredCount.load();
-		auto newValue = oldValue + 1;
-		if (newValue >= sharedDB->maxResources) {
+		if (sharedDB->acquiredCount >= sharedDB->maxResources) {
 			//This part is INTENTIONALLY under the mutex, so we avoid having X process doing the same thing, all of them (except one at most) failing!!!
-			sharedDB->acquiredCount = recount();
-			firstLoop               = false;
-			sharedDB->mutex.unlock();
-			continue;
-		} else {
-			sharedDB->acquiredCount.store(newValue);
-			auto curPid = getpid();
-			for (pidPos = 0; pidPos < sharedDB->maxResources; ++pidPos) {
-				if (sharedDB->pidArray[pidPos] == 0) { //find an empty space
-					sharedDB->pidArray[pidPos] = curPid;
-					break;
-				}
+			recount();
+			//we try hot path once more before sleep
+			if (sharedDB->acquiredCount >= sharedDB->maxResources) {
+				firstLoop = false;
+				sharedDB->mutex.unlock();
+				continue;
 			}
-			if (flock(sharedLockFD, LOCK_SH | LOCK_NB) == 0) {
-				//TODO error check -.-
-			}
-			sharedDB->mutex.unlock();
-			return true;
 		}
+
+		//Problem what if a single application uses more resources ? we will end up counting them multiple times...
+		//even storing the threadId instead of the pid, will not fix the problem, only make more obscure
+		//so the proper fix is not here but in recount... where we scan each pid only once...
+		sharedDB->acquiredCount++;
+		auto curPid = getpid();
+		for (pidPos = 0; pidPos < sharedDB->maxResources; ++pidPos) {
+			if (sharedDB->pidArray[pidPos] == 0) { //find an empty space
+				sharedDB->pidArray[pidPos] = curPid;
+				break;
+			}
+		}
+
+		//we do not even need to lock the second file!! just open is enough
+		sharedLockFD = open(sharedLockName.c_str(), O_CREAT | O_RDWR, 0666);
+		if (sharedLockFD == -1) {
+			auto what = std::string("impossible to open ");
+			auto err  = std::make_error_code(errc::io_error);
+			throw fs::filesystem_error(what, singleLockName, err);
+		}
+
+		sharedDB->mutex.unlock();
+		return true;
 	}
 }
 
@@ -256,39 +274,63 @@ void Semaphore2::release() {
 	sharedDB->acquiredCount--;
 	//free the record
 	sharedDB->pidArray[pidPos] = 0;
-	if (flock(sharedLockFD, LOCK_UN) == 0) {
-		//TODO error check -.-
-	}
+	close(sharedLockFD);
+	sharedLockFD = 0;
 	sharedDB->mutex.unlock();
 }
 
-uint pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint pidCount) {
+uint32_t pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint maxResources) {
 	//this function must run under the LOCKED MUTEX!!!
-	uint     stillUsed = 0;
-	fs::path path      = _path;
-	for (uint pidPos = 0; pidPos < pidCount; ++pidPos) {
+	uint stillUsed = 0;
+	//we must scan each pid just once, or we overcount the file descriptor
+	unordered_set<__pid_t> alreadyScannedPid;
+	fs::path               path = _path;
+	for (uint pidPos = 0; pidPos < maxResources; ++pidPos) {
 		if (pidArray[pidPos] != 0) { //find an empty space
 			auto curPid = pidArray[pidPos].load();
-			auto dir    = fs::path("/proc/" + to_string(curPid) + "/fd/");
+			//check if already processed
+			if (alreadyScannedPid.find(curPid) == alreadyScannedPid.cend()) {
+				alreadyScannedPid.insert(curPid);
+			} else {
+				continue;
+			}
+
+			auto dir = fs::path("/proc/" + to_string(curPid) + "/fd/");
 			if (!fs::exists(dir)) {
 				pidArray[pidPos] = 0;
 				continue;
 			}
 			for (auto&& file : fs::directory_iterator(dir)) {
 				//cout << file << "\n";
-				auto target = fs::read_symlink(file);
-				if (target == path) {
-					stillUsed++;
+				try {
+					auto target = fs::read_symlink(file);
+					if (target == path) {
+						stillUsed++;
+					}
+				} catch (const fs::filesystem_error& e) {
+					//cout << e.what() << e.path1() << "\n";
+					//is possible to have error of missing file, the initial part is not mutex sync with that second one
+					//so in case of stamped at the beginning is possible to try to read a file no longer open
 				}
+
 			}
 		}
 	}
 	return stillUsed;
 }
 
-uint32_t Semaphore2::recount() {
+void Semaphore2::recount() {
 	typedef chrono::high_resolution_clock timer;
-	auto                                  start = timer::now();
+
+	auto                start = timer::now().time_since_epoch();
+	chrono::nanoseconds last(sharedDB->lastRecount);
+	sharedDB->lastRecount = start.count();
+	auto d1 = start - last;
+	if (d1 < 0.1s) {
+		//do not spam request, is useless
+		info.recountSkipped++;
+		return;
+	}
 	//Poor man lslocks, on a production server of ours
 	//lsof takes 0.5 second, lslock... I terminated after 5 second (non busy server)
 	//So is totally unconceivable to run the stock version...
@@ -297,13 +339,13 @@ uint32_t Semaphore2::recount() {
 
 	//this one having to scan just a few process with few files open is around 10uS
 	//1 process with 100 file is 523uS
-	//If we scan 20 process with 100+ files open each is instead 23ms, so time scaling is linear
+	//If we scan 10 process with 100 files open each is instead 23ms, so time scaling is still super good
 	auto effective = pmFuser(sharedLockName, sharedDB->pidArray, sharedDB->maxResources.load());
 	auto end       = timer::now();
 	auto delta     = end - start;
 
-	sharedDB->acquiredCount = effective;
-	//uint64_t neu = chrono::time_point_cast<chrono::nanoseconds>(now).time_since_epoch().count();
+	info.recountDone++;
+	sharedDB->acquiredCount.store(effective);
+
 	//sharedDB->lastRecount.store(neu);
-	return 0;
 }

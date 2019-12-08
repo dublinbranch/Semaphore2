@@ -5,9 +5,9 @@
 #include <chrono>
 
 class SharedDB;
-
 class Semaphore2 {
       public:
+
 	Semaphore2() = default;
 	bool init(uint32_t maxResources, const std::string& _path = std::string());
 
@@ -24,9 +24,8 @@ class Semaphore2 {
 	void release();
 	/**
 	 * @brief recount will recount how many lock has sharedLockFD
-	 * @return
 	 */
-	uint32_t recount();
+	void recount();
 
       private:
 	//This will be used like a mutex to protec shared mem initialization
@@ -40,6 +39,7 @@ class Semaphore2 {
 	//in which pos of the sharedDB pidArray we registered ourself
 	int pidPos = 0;
 
+	//just to forward declare
 	SharedDB* sharedDB = nullptr;
 };
 #endif // SEMAPHORE2_H
