@@ -15,55 +15,8 @@
 #include <unordered_set>
 
 namespace fs = std::filesystem;
+typedef std::chrono::high_resolution_clock timer;
 using namespace std;
-
-class SHMMutex {
-      private:
-	pthread_mutex_t _handle;
-
-      public:
-	explicit SHMMutex() = default;
-	void init();
-	virtual ~SHMMutex();
-
-	void lock();
-	void unlock();
-	bool tryLock();
-};
-
-void SHMMutex::init() {
-	pthread_mutexattr_t attr;
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_FAST_NP);
-
-	if (pthread_mutex_init(&_handle, &attr) == -1) {
-		throw "Unable to create mutex";
-	}
-}
-SHMMutex::~SHMMutex() {
-	::pthread_mutex_destroy(&_handle);
-}
-void SHMMutex::lock() {
-	if (::pthread_mutex_lock(&_handle) != 0) {
-		throw "Unable to lock mutex";
-	}
-}
-void SHMMutex::unlock() {
-	if (::pthread_mutex_unlock(&_handle) != 0) {
-		throw "Unable to unlock mutex";
-	}
-}
-bool SHMMutex::tryLock() {
-	int tryResult = ::pthread_mutex_trylock(&_handle);
-	if (tryResult != 0) {
-		if (EBUSY == tryResult)
-			return false;
-		throw "Unable to lock mutex";
-	}
-	return true;
-}
-
 /**
  * @brief The SharedDB struct
  * think about it as a singleton, only between several process, and different time too
@@ -79,9 +32,6 @@ struct SharedDB {
 	//TODO implement This is used to avoid recounting continuously. is useless!
 	std::atomic<uint64_t> lastRecount;
 
-	//I have no idea if is possible to manipulate a list of fixed size with no mutex.
-	SHMMutex mutex;
-
 	std::atomic<uint32_t> acquiredCount;
 	//array is inited only to avoid warning, real dimension will be computed later, OFC size can not exceed allowed max resources!
 	//to speed up lock recount we keep a list of pid that are subscribed to this sempaphore
@@ -92,7 +42,6 @@ struct SharedDB {
 		revisionId    = currentRevisionId;
 		acquiredCount = 0;
 		maxResources  = max;
-		mutex.init();
 		memset(&pidArray, 0, max * sizeof(__pid_t)); //I think is not needed but...
 	}
 	static uint32_t spaceRequired(uint32_t max) {
@@ -102,13 +51,12 @@ struct SharedDB {
 	}
 };
 
-
 /**
  * @brief The Info struct is for info / debug purpose
  * overhead is minimal so is kept active
  */
-struct Info{
-	std::atomic<uint> recountDone = 0;
+struct Info {
+	std::atomic<uint> recountDone    = 0;
 	std::atomic<uint> recountSkipped = 0;
 };
 
@@ -147,19 +95,17 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 	//Do not try to use LOCK_NB! You can remain here for hours...
 	//also note the initialization part is very few microsecond so sleep is minimal
 
-	//TODO this is still broken
-	uint maxTry = 100;
-	uint curTry = 0;
-	while (true) {
-		curTry++;
-		if (flock(singleLockFD, LOCK_EX | LOCK_NB) == 0) {
-			break;
-		}
-		if (curTry > maxTry) {
-			throw std::runtime_error("too many trial to lock" + singleLockName);
-		}
-		std::this_thread::sleep_for(0.001ms);
-	}
+	fLock();
+
+	//now that we have a "reliable" lock, we must check if the Sem2 status has been left locked by a previous run
+	//This is a very bad status that will normally require a change in the lock file name...
+
+	//To havoid we just need to run the recount and see if there are 0 application subscribed ???
+	//The problem is that those are two different locking mechanism that should not be mixed..
+	//So I have to remove the shared mutex, in favor of only this file based mutex...
+	//which is a bit slower, but is totally irrelevant, we are doing an important, once off task !
+	//PS standard mutex.lock and unlock is just a pari of atomic ops, contention is slow!
+	//mutex lock is say 100ns, file based lock 7000 at max, so not the a critical change.
 
 	//Do the system is already bootstrapped ?
 	struct stat buf;
@@ -200,11 +146,9 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 	//	std::cout << "max" << &sharedDB->maxResources << "\n";
 
 	//and unlocked so the other can start to run
-	if (flock(singleLockFD, LOCK_UN) == -1) {
-		throw "impossible to unlock, how is that even possible";
-	}
-	close(singleLockFD);
-	singleLockFD = 0;
+
+	//close(singleLockFD);
+	//singleLockFD = 0;
 
 	//TODO add some check if we have enought space left to create folder and file name!
 	return true;
@@ -212,8 +156,7 @@ bool Semaphore2::init(uint32_t maxResources, const std::string& _path) {
 
 bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 	//TODO check if monotonic bla bla bla
-	std::chrono::high_resolution_clock timer;
-	auto                               startTime = timer.now();
+	auto startTime = timer::now();
 
 	//	std::cout << "shared" << &sharedDB << "\n";
 	//	std::cout << "revId" << &sharedDB->revisionId << "\n";
@@ -223,7 +166,7 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 	while (true) {
 		if (!firstLoop) {
 			//check if this took too much time and just abandon the task
-			auto curTime = timer.now();
+			auto curTime = timer::now();
 			auto elapsed = curTime - startTime;
 			if (elapsed > maxWait) {
 				return false;
@@ -232,14 +175,14 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 			this_thread::sleep_for(0.1s);
 		}
 
-		sharedDB->mutex.lock();
+		fLock();
 		if (sharedDB->acquiredCount >= sharedDB->maxResources) {
 			//This part is INTENTIONALLY under the mutex, so we avoid having X process doing the same thing, all of them (except one at most) failing!!!
 			recount();
 			//we try hot path once more before sleep
 			if (sharedDB->acquiredCount >= sharedDB->maxResources) {
 				firstLoop = false;
-				sharedDB->mutex.unlock();
+				fUnlock();
 				continue;
 			}
 		}
@@ -264,19 +207,19 @@ bool Semaphore2::acquire(const std::chrono::nanoseconds& maxWait) {
 			throw fs::filesystem_error(what, singleLockName, err);
 		}
 
-		sharedDB->mutex.unlock();
+		fUnlock();
 		return true;
 	}
 }
 
 void Semaphore2::release() {
-	sharedDB->mutex.lock();
+	fLock();
 	sharedDB->acquiredCount--;
 	//free the record
 	sharedDB->pidArray[pidPos] = 0;
 	close(sharedLockFD);
 	sharedLockFD = 0;
-	sharedDB->mutex.unlock();
+	fUnlock();
 }
 
 uint32_t pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint maxResources) {
@@ -312,7 +255,6 @@ uint32_t pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint
 					//is possible to have error of missing file, the initial part is not mutex sync with that second one
 					//so in case of stamped at the beginning is possible to try to read a file no longer open
 				}
-
 			}
 		}
 	}
@@ -320,12 +262,10 @@ uint32_t pmFuser(const std::string& _path, std::atomic<__pid_t> pidArray[], uint
 }
 
 void Semaphore2::recount() {
-	typedef chrono::high_resolution_clock timer;
-
 	auto                start = timer::now().time_since_epoch();
 	chrono::nanoseconds last(sharedDB->lastRecount);
 	sharedDB->lastRecount = start.count();
-	auto d1 = start - last;
+	auto d1               = start - last;
 	if (d1 < 0.1s) {
 		//do not spam request, is useless
 		info.recountSkipped++;
@@ -348,4 +288,21 @@ void Semaphore2::recount() {
 	sharedDB->acquiredCount.store(effective);
 
 	//sharedDB->lastRecount.store(neu);
+}
+
+void Semaphore2::fLock() {
+	if(flock(singleLockFD, LOCK_EX) == -1){
+		throw "impossible to lock, how is that even possible";
+	}
+	/* LOCK_NB for non blocking and time to lock
+	if (flock(singleLockFD, LOCK_EX) == 0) {
+		break;
+	}
+	*/
+}
+
+void Semaphore2::fUnlock() {
+	if (flock(singleLockFD, LOCK_UN) == -1) {
+		throw "impossible to unlock, how is that even possible";
+	}
 }

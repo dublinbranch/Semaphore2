@@ -28,6 +28,9 @@ class Semaphore2 {
 	void recount();
 
       private:
+	//TODO add lock timeout ?
+	void fLock();
+	void fUnlock();
 	//This will be used like a mutex to protec shared mem initialization
 	std::string singleLockName;
 	//This will be used to count how many process are attive

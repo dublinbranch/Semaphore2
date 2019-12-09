@@ -15,7 +15,7 @@ std::atomic<uint> no = 0;
 void tryal(){
 	try {
 		Semaphore2 sem;
-		sem.init(10,"g16");
+		sem.init(10,"g17");
 		//incredible but true, first use of this lib is to test itself!!!
 		if(sem.acquire(420ms)){
 			ok++;
